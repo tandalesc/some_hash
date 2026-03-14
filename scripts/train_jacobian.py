@@ -64,6 +64,8 @@ def run_validation(model, cfg, device, device_type, amp_dtype, use_amp, num_batc
             perturbations_per_msg=cfg.perturbations_per_msg,
             max_delta=cfg.max_delta,
             device=device,
+            num_rounds=cfg.num_rounds,
+            num_blocks=cfg.num_blocks,
         )
 
         messages = data["messages"]
@@ -138,9 +140,28 @@ def train(cfg: JacobianConfig):
 
     print(f"JacobianNet parameters: {param_count:,}")
     print(f"Mode: {mode}")
+    print(f"MD5: {cfg.num_rounds} rounds, {cfg.num_blocks} blocks")
+    print(f"Loss: {cfg.loss_fn}")
     print(f"Config: bs={cfg.batch_size}, lr={cfg.lr}, layers={cfg.n_layers}, "
           f"d_model={cfg.d_model}, dtype={cfg.dtype}, device={device}")
     print(f"Perturbations: {cfg.perturbations_per_msg}/msg, max_delta={cfg.max_delta}")
+
+    # Log target statistics from one batch
+    with torch.no_grad():
+        sample_data = generate_jacobian_batch(
+            min(cfg.batch_size, 64), cfg.perturbations_per_msg,
+            cfg.max_delta, device, cfg.num_rounds, cfg.num_blocks,
+        )
+        sample_targets = compute_jacobian_targets(
+            sample_data["messages"], sample_data["positions"],
+            sample_data["deltas"], sample_data["hash_changes"],
+        )
+        t_mean = sample_targets.abs().mean().item()
+        t_std = sample_targets.std().item()
+        t_max = sample_targets.abs().max().item()
+        nonzero_frac = (sample_data["hash_changes"] != 0).float().mean().item()
+        print(f"Target stats: mean_abs={t_mean:.2f}, std={t_std:.2f}, "
+              f"max_abs={t_max:.1f}, nonzero_frac={nonzero_frac:.3f}")
 
     if cfg.compile and hasattr(torch, "compile"):
         try:
@@ -172,6 +193,8 @@ def train(cfg: JacobianConfig):
             perturbations_per_msg=cfg.perturbations_per_msg,
             max_delta=cfg.max_delta,
             device=device,
+            num_rounds=cfg.num_rounds,
+            num_blocks=cfg.num_blocks,
         )
 
         messages = data["messages"]
@@ -191,7 +214,16 @@ def train(cfg: JacobianConfig):
             predicted_change = J_pred * deltas.float().unsqueeze(-1)
             actual_change = hash_changes.float()
 
-            loss = F.mse_loss(predicted_change, actual_change)
+            if cfg.loss_fn == "cosine":
+                # Negative cosine similarity (maximize alignment, not magnitude)
+                cos = F.cosine_similarity(
+                    predicted_change.reshape(-1, 16),
+                    actual_change.reshape(-1, 16),
+                    dim=-1,
+                )
+                loss = 1.0 - cos.mean()
+            else:
+                loss = F.mse_loss(predicted_change, actual_change)
 
         optimizer.zero_grad()
         loss.backward()
@@ -249,6 +281,10 @@ def main():
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--n-heads", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--num-rounds", type=int, default=None,
+                        help="MD5 rounds per block (1-64, default 64)")
+    parser.add_argument("--loss", type=str, default=None,
+                        choices=["mse", "cosine"], help="Loss function")
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
@@ -273,6 +309,8 @@ def main():
         d_model=args.d_model,
         n_heads=args.n_heads,
         device=args.device,
+        num_rounds=args.num_rounds,
+        loss_fn=args.loss,
         compile=False if args.no_compile else None,
     )
 

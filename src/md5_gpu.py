@@ -58,19 +58,21 @@ def _words_to_bytes(state: torch.Tensor) -> torch.Tensor:
 
 def _process_block(M: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                    c: torch.Tensor, d: torch.Tensor,
-                   K_tensor: torch.Tensor) -> tuple:
+                   K_tensor: torch.Tensor,
+                   num_rounds: int = 64) -> tuple:
     """Process a single 512-bit block through MD5 compression.
 
     Args:
         M: (B, 16) message words
         a, b, c, d: (B,) current state
         K_tensor: (64,) precomputed constants on device
+        num_rounds: number of MD5 rounds to run (1-64, default 64)
     Returns:
         Updated (a, b, c, d)
     """
     a0, b0, c0, d0 = a, b, c, d
 
-    for i in range(64):
+    for i in range(num_rounds):
         if i < 16:
             # F(b,c,d) = (b & c) | (~b & d)
             f = (b & c) | ((b ^ MASK32) & d)
@@ -102,46 +104,40 @@ def _process_block(M: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
     return a, b, c, d
 
 
-def md5(messages: torch.Tensor) -> torch.Tensor:
+def md5(messages: torch.Tensor, num_rounds: int = 64,
+        num_blocks: int = 2) -> torch.Tensor:
     """Compute MD5 hash of 64-byte messages using pure PyTorch.
 
     Args:
         messages: (B, 64) int64 tensor of byte values [0, 255]
+        num_rounds: MD5 rounds per block (1-64, default 64 = full MD5)
+        num_blocks: 1 = message block only, 2 = message + padding (default)
     Returns:
         (B, 16) int64 tensor of hash bytes [0, 255]
     """
     B = messages.shape[0]
     device = messages.device
 
-    # Pre-compute K tensor on device
     K_tensor = torch.tensor(_K, dtype=torch.int64, device=device)
-
-    # Block 1: the 64 message bytes
     M1 = _bytes_to_words(messages)
 
-    # Block 2: MD5 padding for 64-byte (512-bit) input
-    # Padding: 0x80, then 55 zero bytes, then 64-bit length in bits (little-endian)
-    # Length = 64 bytes = 512 bits = 0x200
-    pad_block = torch.zeros(B, 64, dtype=torch.int64, device=device)
-    pad_block[:, 0] = 0x80
-    # Length in bits = 512 = 0x200, stored as little-endian 64-bit at bytes 56-63
-    pad_block[:, 56] = 0x00  # 512 & 0xFF = 0x00
-    pad_block[:, 57] = 0x02  # (512 >> 8) & 0xFF = 0x02
-    # bytes 58-63 remain 0
-    M2 = _bytes_to_words(pad_block)
-
-    # Initial state
     a = torch.full((B,), _A0, dtype=torch.int64, device=device)
     b = torch.full((B,), _B0, dtype=torch.int64, device=device)
     c = torch.full((B,), _C0, dtype=torch.int64, device=device)
     d = torch.full((B,), _D0, dtype=torch.int64, device=device)
 
-    # Process block 1
-    a, b, c, d = _process_block(M1, a, b, c, d, K_tensor)
-    # Process block 2 (padding)
-    a, b, c, d = _process_block(M2, a, b, c, d, K_tensor)
+    # Block 1: message
+    a, b, c, d = _process_block(M1, a, b, c, d, K_tensor, num_rounds)
 
-    # Convert state to bytes (little-endian)
+    # Block 2: padding
+    if num_blocks >= 2:
+        pad_block = torch.zeros(B, 64, dtype=torch.int64, device=device)
+        pad_block[:, 0] = 0x80
+        pad_block[:, 56] = 0x00
+        pad_block[:, 57] = 0x02
+        M2 = _bytes_to_words(pad_block)
+        a, b, c, d = _process_block(M2, a, b, c, d, K_tensor, num_rounds)
+
     state = torch.stack([a, b, c, d], dim=1)
     return _words_to_bytes(state)
 

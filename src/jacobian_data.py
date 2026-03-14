@@ -17,6 +17,8 @@ def generate_jacobian_batch(
     perturbations_per_msg: int = 8,
     max_delta: int = 3,
     device: str = "cpu",
+    num_rounds: int = 64,
+    num_blocks: int = 2,
 ) -> dict:
     """Generate training data for the Jacobian network.
 
@@ -49,7 +51,7 @@ def generate_jacobian_batch(
     messages = torch.randint(0, 256, (B, 64), dtype=torch.int64, device=device)
 
     # Compute base hashes
-    base_hashes = md5(messages)  # (B, 16)
+    base_hashes = md5(messages, num_rounds=num_rounds, num_blocks=num_blocks)  # (B, 16)
 
     # Sample random positions and deltas for perturbations
     positions = torch.randint(0, 64, (B, K), dtype=torch.int64, device=device)
@@ -67,7 +69,7 @@ def generate_jacobian_batch(
     expanded.scatter_(2, pos_idx, perturbed_vals.unsqueeze(-1))
 
     perturbed_flat = expanded.reshape(B * K, 64)
-    perturbed_hashes = md5(perturbed_flat).reshape(B, K, 16)
+    perturbed_hashes = md5(perturbed_flat, num_rounds=num_rounds, num_blocks=num_blocks).reshape(B, K, 16)
 
     # Compute signed hash changes: wrap to [-128, 127]
     base_expanded = base_hashes.unsqueeze(1).expand(B, K, 16)

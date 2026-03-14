@@ -87,10 +87,15 @@ class JacobianConfig:
     ste_mode: str = "complex"
     n_snapshots: int = 7
 
+    # MD5 variant
+    num_rounds: int = 64
+    num_blocks: int = 2
+
     # Training
     batch_size: int = 256
     perturbations_per_msg: int = 8
     max_delta: int = 3
+    loss_fn: str = "cosine"  # "mse" or "cosine"
     lr: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500
