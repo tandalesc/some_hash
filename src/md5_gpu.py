@@ -142,6 +142,70 @@ def md5(messages: torch.Tensor, num_rounds: int = 64,
     return _words_to_bytes(state)
 
 
+def md5_intermediates(messages: torch.Tensor, num_rounds: int = 64,
+                      num_blocks: int = 1) -> list[torch.Tensor]:
+    """Compute MD5 and return state (a,b,c,d) after every round.
+
+    Args:
+        messages: (B, 64) int64 byte tensor
+        num_rounds: rounds per block
+        num_blocks: 1 or 2
+    Returns:
+        List of (B, 4) int64 tensors — state after each round.
+        Length = num_rounds * num_blocks + 1 (includes initial state).
+    """
+    B = messages.shape[0]
+    device = messages.device
+    K_tensor = torch.tensor(_K, dtype=torch.int64, device=device)
+    M1 = _bytes_to_words(messages)
+
+    a = torch.full((B,), _A0, dtype=torch.int64, device=device)
+    b = torch.full((B,), _B0, dtype=torch.int64, device=device)
+    c = torch.full((B,), _C0, dtype=torch.int64, device=device)
+    d = torch.full((B,), _D0, dtype=torch.int64, device=device)
+
+    states = [torch.stack([a, b, c, d], dim=1)]  # initial state
+
+    def _run_block(M, a, b, c, d, nr):
+        a0, b0, c0, d0 = a, b, c, d
+        for i in range(nr):
+            if i < 16:
+                f = (b & c) | ((b ^ MASK32) & d)
+                g = i
+            elif i < 32:
+                f = (d & b) | ((d ^ MASK32) & c)
+                g = (5 * i + 1) % 16
+            elif i < 48:
+                f = b ^ c ^ d
+                g = (3 * i + 5) % 16
+            else:
+                f = c ^ (b | (d ^ MASK32))
+                g = (7 * i) % 16
+            f = (f + a + K_tensor[i] + M[:, g]) & MASK32
+            a = d
+            d = c
+            c = b
+            b = (b + _left_rotate(f, _SHIFT[i])) & MASK32
+            states.append(torch.stack([a, b, c, d], dim=1))
+        a = (a + a0) & MASK32
+        b = (b + b0) & MASK32
+        c = (c + c0) & MASK32
+        d = (d + d0) & MASK32
+        return a, b, c, d
+
+    a, b, c, d = _run_block(M1, a, b, c, d, num_rounds)
+
+    if num_blocks >= 2:
+        pad_block = torch.zeros(B, 64, dtype=torch.int64, device=device)
+        pad_block[:, 0] = 0x80
+        pad_block[:, 56] = 0x00
+        pad_block[:, 57] = 0x02
+        M2 = _bytes_to_words(pad_block)
+        a, b, c, d = _run_block(M2, a, b, c, d, num_rounds)
+
+    return states
+
+
 def verify_against_hashlib(num_tests: int = 1000, device: str = "cpu") -> bool:
     """Verify GPU MD5 matches hashlib for random inputs.
 
