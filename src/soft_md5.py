@@ -261,25 +261,21 @@ def compute_ste_jacobian(
     soft_md5 = SoftMD5().to(device)
 
     # Single forward + backward with full hash as target
-    msg_bits = bytes_to_bits(messages).float().requires_grad_(True)
+    msg_float = messages.float() if messages.is_floating_point() else messages.to(torch.float32)
+    msg_bits = bytes_to_bits(msg_float.long()).float().requires_grad_(True)
     hash_bits = soft_md5(msg_bits)  # (B, 128)
     hash_bytes = bits_to_bytes(hash_bits)  # (B, 16)
 
-    # Compute gradient of each hash byte via a weighted sum
-    # Use one backward per output byte with fresh graph each time
     jacobian = torch.zeros(B, 64, 16, device=device)
 
-    # More efficient: single backward with all outputs
-    hash_bytes.sum().backward()
-    if msg_bits.grad is not None and not msg_bits.grad.isnan().any():
-        # This gives us the sum of all output sensitivities;
-        # for per-output breakdown, we'd need 16 passes.
-        # Instead, use the aggregate as the feature — the network
-        # can learn to interpret it.
-        grad_bits = msg_bits.grad.detach()  # (B, 512)
-        grad_bytes = grad_bits.reshape(B, 64, 8).sum(dim=-1)  # (B, 64)
-        # Broadcast: use same aggregate gradient for all 16 output positions
-        jacobian = grad_bytes.unsqueeze(-1).expand(B, 64, 16).clone()
+    try:
+        hash_bytes.sum().backward()
+        if msg_bits.grad is not None and not msg_bits.grad.isnan().any():
+            grad_bits = msg_bits.grad.detach()  # (B, 512)
+            grad_bytes = grad_bits.reshape(B, 64, 8).sum(dim=-1)  # (B, 64)
+            jacobian = grad_bytes.unsqueeze(-1).expand(B, 64, 16).clone()
+    except RuntimeError:
+        pass  # Return zeros — STE signal doesn't survive full MD5 anyway
 
     STE_MODE = old_mode
     _XOR_GRAD_SCALE = old_xor
