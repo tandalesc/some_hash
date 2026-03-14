@@ -53,8 +53,28 @@ def generate_jacobian_batch(
     # Compute base hashes
     base_hashes = md5(messages, num_rounds=num_rounds, num_blocks=num_blocks)  # (B, 16)
 
-    # Sample random positions and deltas for perturbations
-    positions = torch.randint(0, 64, (B, K), dtype=torch.int64, device=device)
+    # Sample perturbation positions — only target bytes that the MD5 message
+    # schedule actually uses in the first num_rounds rounds.
+    # MD5 message schedule: round i uses word g(i), each word = 4 bytes.
+    # Rounds 0-15: g=i, Rounds 16-31: g=(5i+1)%16, etc.
+    active_words = set()
+    for i in range(min(num_rounds, 64)):
+        if i < 16:
+            active_words.add(i)
+        elif i < 32:
+            active_words.add((5 * i + 1) % 16)
+        elif i < 48:
+            active_words.add((3 * i + 5) % 16)
+        else:
+            active_words.add((7 * i) % 16)
+    # Convert words to byte indices (each word = 4 bytes)
+    active_bytes = []
+    for w in sorted(active_words):
+        active_bytes.extend([w * 4, w * 4 + 1, w * 4 + 2, w * 4 + 3])
+    active_bytes_t = torch.tensor(active_bytes, dtype=torch.int64, device=device)
+    # Sample from active bytes only
+    idx = torch.randint(0, len(active_bytes_t), (B, K), device=device)
+    positions = active_bytes_t[idx]
 
     # Sample non-zero deltas in [-max_delta, max_delta]
     abs_deltas = torch.randint(1, max_delta + 1, (B, K), dtype=torch.int64, device=device)
