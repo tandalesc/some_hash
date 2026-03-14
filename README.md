@@ -9,15 +9,15 @@ preimages. Given a 128-bit target hash, the model iteratively denoises a
 ```
 Input: 64 masked bytes ──→ Token Embed + Pos Embed
                                     │
-                          ┌─────────▼──────────┐
+                          ┌─────────▼───────────┐
                           │  Transformer Block  │ ×N
                           │  ┌───────────────┐  │
   Hash (16 bytes) ───┐    │  │  adaLN-Zero   │  │
-                     ├──→ │  │  Self-Attn     │  │
+                     ├──→ │  │  Self-Attn    │  │
   Timestep t ────────┘    │  │  adaLN-Zero   │  │
-                          │  │  FFN           │  │
+                          │  │  FFN          │  │
                           │  └───────────────┘  │
-                          └─────────┬──────────┘
+                          └─────────┬───────────┘
                                     │
 Output: 64 × 256 logits ◀──── LayerNorm + Linear
 ```
