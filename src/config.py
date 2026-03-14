@@ -82,6 +82,10 @@ class JacobianConfig:
     n_heads: int = 4
     n_layers: int = 4
     dropout: float = 0.0
+    use_ste_features: bool = False
+    use_intermediate_features: bool = False
+    ste_mode: str = "complex"
+    n_snapshots: int = 7
 
     # Training
     batch_size: int = 256

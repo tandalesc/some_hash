@@ -3,6 +3,11 @@
 
 Trains a small transformer to predict MD5's local sensitivity:
 how each input byte affects each hash byte at a given operating point.
+
+Supports three modes:
+  --mode scratch:   learn from raw message bytes only (baseline)
+  --mode ste:       learn residual on top of STE Jacobian approximation
+  --mode full:      STE Jacobian + soft MD5 intermediate states
 """
 
 import argparse
@@ -18,7 +23,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.config import JacobianConfig
-from src.jacobian_data import compute_jacobian_targets, generate_jacobian_batch
+from src.jacobian_data import (
+    compute_intermediate_features,
+    compute_jacobian_targets,
+    compute_ste_features,
+    generate_jacobian_batch,
+)
 from src.jacobian_net import JacobianNet
 
 
@@ -26,6 +36,20 @@ def _save_checkpoint(model, optimizer, cfg, step, path):
     state = model._orig_mod.state_dict() if cfg.compile else model.state_dict()
     torch.save({"model": state, "optimizer": optimizer.state_dict(),
                 "config": cfg, "step": step}, path)
+
+
+def _compute_features(messages, cfg, device):
+    """Compute optional STE and intermediate features."""
+    ste_jac = None
+    intermediates = None
+
+    if cfg.use_ste_features:
+        ste_jac = compute_ste_features(messages, ste_mode=cfg.ste_mode)
+
+    if cfg.use_intermediate_features:
+        intermediates = compute_intermediate_features(messages)
+
+    return ste_jac, intermediates
 
 
 def run_validation(model, cfg, device, device_type, amp_dtype, use_amp, num_batches=4):
@@ -48,20 +72,18 @@ def run_validation(model, cfg, device, device_type, amp_dtype, use_amp, num_batc
         hash_changes = data["hash_changes"]
         targets = compute_jacobian_targets(messages, positions, deltas, hash_changes)
 
+        ste_jac, intermediates = _compute_features(messages, cfg, device)
+
         with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-            J = model(messages)  # (B, 64, 16)
+            J = model(messages, ste_jacobian=ste_jac, intermediates=intermediates)
 
         B, K = positions.shape
+        pos_idx = positions.unsqueeze(-1).expand(B, K, 16)
+        J_pred = torch.gather(J, 1, pos_idx)
 
-        # Gather predicted Jacobian rows for perturbed positions
-        pos_idx = positions.unsqueeze(-1).expand(B, K, 16)  # (B, K, 16)
-        J_pred = torch.gather(J, 1, pos_idx)  # (B, K, 16)
-
-        # Predicted change = J_pred * delta
         predicted_change = J_pred * deltas.float().unsqueeze(-1)
         actual_change = hash_changes.float()
 
-        # Cosine similarity per perturbation
         cos_sim = F.cosine_similarity(
             predicted_change.reshape(-1, 16),
             actual_change.reshape(-1, 16),
@@ -101,10 +123,21 @@ def train(cfg: JacobianConfig):
         n_heads=cfg.n_heads,
         n_layers=cfg.n_layers,
         dropout=cfg.dropout,
+        use_ste_features=cfg.use_ste_features,
+        use_intermediate_features=cfg.use_intermediate_features,
+        n_snapshots=cfg.n_snapshots,
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
+    features = []
+    if cfg.use_ste_features:
+        features.append(f"ste({cfg.ste_mode})")
+    if cfg.use_intermediate_features:
+        features.append(f"intermediates({cfg.n_snapshots})")
+    mode = " + ".join(features) if features else "scratch"
+
     print(f"JacobianNet parameters: {param_count:,}")
+    print(f"Mode: {mode}")
     print(f"Config: bs={cfg.batch_size}, lr={cfg.lr}, layers={cfg.n_layers}, "
           f"d_model={cfg.d_model}, dtype={cfg.dtype}, device={device}")
     print(f"Perturbations: {cfg.perturbations_per_msg}/msg, max_delta={cfg.max_delta}")
@@ -120,7 +153,6 @@ def train(cfg: JacobianConfig):
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
 
-    # Linear warmup then cosine decay
     def lr_schedule(step):
         if step < cfg.warmup_steps:
             return step / cfg.warmup_steps
@@ -135,7 +167,6 @@ def train(cfg: JacobianConfig):
     for step in range(1, cfg.max_steps + 1):
         model.train()
 
-        # Generate batch of perturbation data
         data = generate_jacobian_batch(
             batch_size=cfg.batch_size,
             perturbations_per_msg=cfg.perturbations_per_msg,
@@ -147,39 +178,32 @@ def train(cfg: JacobianConfig):
         positions = data["positions"]
         deltas = data["deltas"]
         hash_changes = data["hash_changes"]
-        targets = compute_jacobian_targets(messages, positions, deltas, hash_changes)
 
-        # Forward: predict full Jacobian
+        ste_jac, intermediates = _compute_features(messages, cfg, device)
+
         with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp):
-            J = model(messages)  # (B, 64, 16)
+            J = model(messages, ste_jacobian=ste_jac, intermediates=intermediates)
 
             B, K = positions.shape
+            pos_idx = positions.unsqueeze(-1).expand(B, K, 16)
+            J_pred = torch.gather(J, 1, pos_idx)
 
-            # Gather predicted Jacobian rows for perturbed positions
-            pos_idx = positions.unsqueeze(-1).expand(B, K, 16)  # (B, K, 16)
-            J_pred = torch.gather(J, 1, pos_idx)  # (B, K, 16)
-
-            # Predicted change = J_pred * delta
             predicted_change = J_pred * deltas.float().unsqueeze(-1)
             actual_change = hash_changes.float()
 
-            # MSE loss between predicted and actual hash changes
             loss = F.mse_loss(predicted_change, actual_change)
 
-        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
 
-        # Logging
         if step % cfg.log_every == 0:
             elapsed = time.time() - t0
             steps_per_sec = step / elapsed
             lr = optimizer.param_groups[0]["lr"]
 
-            # Quick cosine similarity for monitoring
             with torch.no_grad():
                 cos_sim = F.cosine_similarity(
                     predicted_change.detach().reshape(-1, 16),
@@ -193,7 +217,6 @@ def train(cfg: JacobianConfig):
                 f"cos {mean_cos:.4f} | lr {lr:.2e} | {steps_per_sec:.1f} steps/s"
             )
 
-        # Validation
         if step % cfg.eval_every == 0:
             model.eval()
             with torch.no_grad():
@@ -203,13 +226,11 @@ def train(cfg: JacobianConfig):
                 f"pct_positive={report['pct_positive']:.1f}%"
             )
 
-        # Periodic checkpoint
         if cfg.save_every > 0 and step % cfg.save_every == 0:
             path = ckpt_dir / f"step_{step}.pt"
             _save_checkpoint(model, optimizer, cfg, step, path)
             print(f"  Saved checkpoint to {path}")
 
-    # Final save
     path = ckpt_dir / "final.pt"
     _save_checkpoint(model, optimizer, cfg, step, path)
     print(f"Saved final checkpoint to {path}")
@@ -218,6 +239,9 @@ def train(cfg: JacobianConfig):
 def main():
     parser = argparse.ArgumentParser(description="Train learned Jacobian network")
     parser.add_argument("config", nargs="?", default=None, help="Path to TOML config file")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["scratch", "ste", "full"],
+                        help="Feature mode: scratch, ste (STE Jacobian), full (STE + intermediates)")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -228,13 +252,19 @@ def main():
     parser.add_argument("--no-compile", action="store_true")
     args = parser.parse_args()
 
-    # Load from file or use defaults
     if args.config:
         cfg = JacobianConfig.from_toml(args.config)
     else:
         cfg = JacobianConfig()
 
-    # CLI overrides take precedence
+    # Apply mode shortcut
+    if args.mode == "ste":
+        cfg = cfg.override(use_ste_features=True, use_intermediate_features=False)
+    elif args.mode == "full":
+        cfg = cfg.override(use_ste_features=True, use_intermediate_features=True)
+    elif args.mode == "scratch":
+        cfg = cfg.override(use_ste_features=False, use_intermediate_features=False)
+
     cfg = cfg.override(
         max_steps=args.steps,
         batch_size=args.batch_size,

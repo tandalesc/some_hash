@@ -1,14 +1,16 @@
-# Jacobian network training on 3090 — scratch (baseline)
+# Jacobian network training on 3090 — with STE Jacobian features
+# Network learns the residual correction on top of the STE approximation
 
 [model]
 d_model = 128
 n_heads = 4
 n_layers = 4
-use_ste_features = false
+use_ste_features = true
 use_intermediate_features = false
+ste_mode = "complex"
 
 [training]
-batch_size = 512
+batch_size = 256
 perturbations_per_msg = 8
 max_delta = 3
 lr = 3e-4
@@ -16,7 +18,7 @@ max_steps = 50_000
 eval_every = 500
 log_every = 50
 save_every = 5000
-checkpoint_dir = "checkpoints/jacobian/scratch"
+checkpoint_dir = "checkpoints/jacobian/ste"
 
 [system]
 device = "cuda:1"

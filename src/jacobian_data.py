@@ -2,6 +2,9 @@
 
 Generates perturbation data entirely on GPU using torch random ops
 and the md5_gpu module for batched MD5 computation.
+
+Optionally computes STE Jacobian approximations and soft MD5 intermediate
+states as auxiliary features.
 """
 
 import torch
@@ -52,23 +55,17 @@ def generate_jacobian_batch(
     positions = torch.randint(0, 64, (B, K), dtype=torch.int64, device=device)
 
     # Sample non-zero deltas in [-max_delta, max_delta]
-    # First sample from [1, max_delta], then randomly negate
     abs_deltas = torch.randint(1, max_delta + 1, (B, K), dtype=torch.int64, device=device)
-    signs = torch.randint(0, 2, (B, K), dtype=torch.int64, device=device) * 2 - 1  # -1 or +1
+    signs = torch.randint(0, 2, (B, K), dtype=torch.int64, device=device) * 2 - 1
     deltas = abs_deltas * signs
 
     # Apply perturbations and compute perturbed hashes
-    # Expand messages for all perturbations: (B, K, 64)
     expanded = messages.unsqueeze(1).expand(B, K, 64).clone()
-
-    # Scatter the perturbations into the right positions
-    # positions: (B, K) -> (B, K, 1) for gather/scatter
-    pos_idx = positions.unsqueeze(-1)  # (B, K, 1)
-    original_vals = torch.gather(expanded, 2, pos_idx).squeeze(-1)  # (B, K)
-    perturbed_vals = (original_vals + deltas) % 256  # wrap around byte range
+    pos_idx = positions.unsqueeze(-1)
+    original_vals = torch.gather(expanded, 2, pos_idx).squeeze(-1)
+    perturbed_vals = (original_vals + deltas) % 256
     expanded.scatter_(2, pos_idx, perturbed_vals.unsqueeze(-1))
 
-    # Reshape for batched MD5: (B*K, 64)
     perturbed_flat = expanded.reshape(B * K, 64)
     perturbed_hashes = md5(perturbed_flat).reshape(B, K, 16)
 
@@ -95,16 +92,55 @@ def compute_jacobian_targets(
     For position i with perturbation delta, the Jacobian row target is:
     J_target[i] = hash_change / delta
 
-    Args:
-        messages: (B, 64) base messages (unused, kept for API consistency)
-        positions: (B, K) perturbed byte positions
-        deltas: (B, K) perturbation magnitudes (signed)
-        hash_changes: (B, K, 16) actual change in hash bytes (signed)
-
     Returns:
         (B, K, 16) normalized sensitivity vectors
     """
-    # Normalize by delta to get per-unit sensitivity
-    # deltas: (B, K) -> (B, K, 1) for broadcasting
     targets = hash_changes.float() / deltas.float().unsqueeze(-1)
     return targets
+
+
+def compute_ste_features(
+    messages: torch.Tensor,
+    ste_mode: str = "complex",
+) -> torch.Tensor:
+    """Compute STE Jacobian approximation as input features.
+
+    Args:
+        messages: (B, 64) int64 byte tensor
+        ste_mode: which STE backward pass to use
+
+    Returns:
+        (B, 64, 16) approximate Jacobian from soft MD5
+    """
+    from .soft_md5 import compute_ste_jacobian
+    return compute_ste_jacobian(messages, ste_mode=ste_mode)
+
+
+def compute_intermediate_features(
+    messages: torch.Tensor,
+    snapshot_rounds: tuple[int, ...] = (0, 4, 8, 16, 32, 48, 63),
+) -> torch.Tensor:
+    """Compute soft MD5 intermediate state snapshots as features.
+
+    Args:
+        messages: (B, 64) int64 byte tensor
+        snapshot_rounds: which rounds to capture state at
+
+    Returns:
+        (B, N, 16) intermediate state bytes, N = len(snapshot_rounds)
+    """
+    from .soft_md5 import SoftMD5, bytes_to_bits
+
+    device = messages.device
+    soft_md5 = SoftMD5().to(device)
+
+    # Convert to soft bits (detached — no gradient needed for features)
+    msg_bits = bytes_to_bits(messages).float()
+
+    with torch.no_grad():
+        _, snapshots = soft_md5.forward_with_intermediates(
+            msg_bits, snapshot_rounds=snapshot_rounds
+        )
+
+    # Stack snapshots: list of (B, 16) -> (B, N, 16)
+    return torch.stack(snapshots, dim=1)

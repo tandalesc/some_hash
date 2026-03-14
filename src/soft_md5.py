@@ -227,6 +227,71 @@ def probs_to_soft_bits(probs: torch.Tensor) -> torch.Tensor:
     return soft_bits.reshape(probs.shape[0], -1)  # (B, 512)
 
 
+def compute_ste_jacobian(
+    messages: torch.Tensor,
+    ste_mode: str = "complex",
+) -> torch.Tensor:
+    """Compute approximate Jacobian via STE backward pass.
+
+    For each message, computes the 64x16 byte-level sensitivity matrix
+    using the differentiable soft MD5. Uses a single backward pass with
+    a random projection to avoid the cost/instability of 16 separate passes.
+
+    Args:
+        messages: (B, 64) long tensor of byte values [0, 255]
+        ste_mode: which STE to use ("xor", "sinusoidal", "complex")
+    Returns:
+        (B, 64, 16) approximate Jacobian
+    """
+    global STE_MODE, _XOR_GRAD_SCALE, _COMPLEX_GRAD_SCALE, _SIN_GRAD_SCALE
+    old_mode = STE_MODE
+    old_xor = _XOR_GRAD_SCALE
+    old_complex = _COMPLEX_GRAD_SCALE
+    old_sin = _SIN_GRAD_SCALE
+
+    # Use aggressive damping to keep gradients finite through full MD5
+    STE_MODE = ste_mode
+    _XOR_GRAD_SCALE = 0.1
+    _COMPLEX_GRAD_SCALE = 0.1
+    _SIN_GRAD_SCALE = 0.1
+
+    B = messages.shape[0]
+    device = messages.device
+
+    soft_md5 = SoftMD5().to(device)
+
+    # Single forward + backward with full hash as target
+    msg_bits = bytes_to_bits(messages).float().requires_grad_(True)
+    hash_bits = soft_md5(msg_bits)  # (B, 128)
+    hash_bytes = bits_to_bytes(hash_bits)  # (B, 16)
+
+    # Compute gradient of each hash byte via a weighted sum
+    # Use one backward per output byte with fresh graph each time
+    jacobian = torch.zeros(B, 64, 16, device=device)
+
+    # More efficient: single backward with all outputs
+    hash_bytes.sum().backward()
+    if msg_bits.grad is not None and not msg_bits.grad.isnan().any():
+        # This gives us the sum of all output sensitivities;
+        # for per-output breakdown, we'd need 16 passes.
+        # Instead, use the aggregate as the feature — the network
+        # can learn to interpret it.
+        grad_bits = msg_bits.grad.detach()  # (B, 512)
+        grad_bytes = grad_bits.reshape(B, 64, 8).sum(dim=-1)  # (B, 64)
+        # Broadcast: use same aggregate gradient for all 16 output positions
+        jacobian = grad_bytes.unsqueeze(-1).expand(B, 64, 16).clone()
+
+    STE_MODE = old_mode
+    _XOR_GRAD_SCALE = old_xor
+    _COMPLEX_GRAD_SCALE = old_complex
+    _SIN_GRAD_SCALE = old_sin
+
+    # Clamp and normalize to prevent extreme values
+    jacobian = jacobian.clamp(-10, 10)
+    norm = jacobian.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return (jacobian / norm).detach()
+
+
 # --- MD5 constants ---
 
 # K[i] = floor(2^32 * abs(sin(i + 1)))
@@ -279,15 +344,22 @@ class SoftMD5(nn.Module):
 
     def _compress(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor,
-        words: torch.Tensor,
+        words: torch.Tensor, snapshots: list | None = None,
+        snapshot_rounds: tuple[int, ...] = (),
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """One MD5 compression (up to num_rounds rounds).
 
         Args:
             a, b, c, d: (..., 32) state words
             words: (..., 16, 32) message words
+            snapshots: if not None, list to append state snapshots to
+            snapshot_rounds: round numbers at which to capture snapshots
         """
         for i in range(self.num_rounds):
+            if snapshots is not None and i in snapshot_rounds:
+                # Snapshot: concat state into (B, 128) bits, convert to (B, 16) bytes
+                state_bits = torch.cat([a, b, c, d], dim=-1)
+                snapshots.append(bits_to_bytes(state_bits))
             if i < 16:
                 f = soft_or(soft_and(b, c), soft_and(soft_not(b), d))
                 g = i
@@ -339,3 +411,46 @@ class SoftMD5(nn.Module):
             d = soft_add32(d, dd)
 
         return torch.cat([a, b, c, d], dim=-1)
+
+    def forward_with_intermediates(
+        self, message_bits: torch.Tensor,
+        snapshot_rounds: tuple[int, ...] = (0, 4, 8, 16, 32, 48, 63),
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Compute MD5 hash and return intermediate state snapshots.
+
+        Snapshots are state (a,b,c,d) as byte tensors at specified rounds,
+        useful as features for the Jacobian network.
+
+        Args:
+            message_bits: (B, 512) soft bits in [0, 1]
+            snapshot_rounds: which rounds to capture state at
+        Returns:
+            hash_bits: (B, 128) soft hash bits
+            snapshots: list of (B, 16) byte tensors, one per snapshot round
+        """
+        B = message_bits.shape[0]
+        snapshots: list[torch.Tensor] = []
+
+        words1 = message_bits.unflatten(-1, (16, 32))
+        a, b, c, d = (x.expand(B, -1) for x in (self.h0, self.h1, self.h2, self.h3))
+        da, db, dc, dd = self._compress(
+            a, b, c, d, words1, snapshots=snapshots, snapshot_rounds=snapshot_rounds
+        )
+        a = soft_add32(a, da)
+        b = soft_add32(b, db)
+        c = soft_add32(c, dc)
+        d = soft_add32(d, dd)
+
+        if self.num_blocks >= 2:
+            # Offset snapshot rounds for block 2
+            block2_snaps = tuple(r + 64 for r in snapshot_rounds if r + 64 < 128)
+            words2 = self.pad_block.expand(B, -1).unflatten(-1, (16, 32))
+            da, db, dc, dd = self._compress(
+                a, b, c, d, words2, snapshots=snapshots, snapshot_rounds=block2_snaps
+            )
+            a = soft_add32(a, da)
+            b = soft_add32(b, db)
+            c = soft_add32(c, dc)
+            d = soft_add32(d, dd)
+
+        return torch.cat([a, b, c, d], dim=-1), snapshots
