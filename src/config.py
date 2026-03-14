@@ -32,6 +32,7 @@ class Config:
 
     # Diffusion
     sampling_steps: int = 64
+    guidance_scale: float = 0.0  # 0 = pure diffusion, >0 = soft MD5 guidance
 
     # System
     device: str = "cuda"
@@ -72,3 +73,63 @@ class Config:
         current = {f.name: getattr(self, f.name) for f in fields(self)}
         current.update(updates)
         return Config(**current)
+
+
+@dataclass
+class JacobianConfig:
+    # Model
+    d_model: int = 128
+    n_heads: int = 4
+    n_layers: int = 4
+    dropout: float = 0.0
+
+    # Training
+    batch_size: int = 256
+    perturbations_per_msg: int = 8
+    max_delta: int = 3
+    lr: float = 3e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 500
+    max_steps: int = 50_000
+    eval_every: int = 500
+    log_every: int = 50
+    save_every: int = 5000
+    checkpoint_dir: str = "checkpoints/jacobian"
+
+    # System
+    device: str = "cuda"
+    compile: bool = True
+    dtype: str = "bfloat16"
+    seed: int = 42
+
+    @classmethod
+    def from_toml(cls, path: str | Path) -> "JacobianConfig":
+        """Load config from a TOML file. Supports [model], [training],
+        and [system] sections, or flat keys."""
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+
+        # Flatten sections into a single dict
+        flat = {}
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                flat.update(value)
+            else:
+                flat[key] = value
+
+        # Only keep keys that match dataclass fields
+        valid = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in flat.items() if k in valid}
+        return cls(**filtered)
+
+    def override(self, **kwargs) -> "JacobianConfig":
+        """Return a new JacobianConfig with the given fields overridden.
+        None values are skipped."""
+        updates = {k: v for k, v in kwargs.items() if v is not None}
+        valid = {f.name for f in fields(self)}
+        for k in updates:
+            if k not in valid:
+                raise ValueError(f"Unknown config field: {k}")
+        current = {f.name: getattr(self, f.name) for f in fields(self)}
+        current.update(updates)
+        return JacobianConfig(**current)

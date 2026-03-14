@@ -1,0 +1,21 @@
+# Jacobian network training on 3090
+[model]
+d_model = 128
+n_heads = 4
+n_layers = 4
+
+[training]
+batch_size = 512
+perturbations_per_msg = 8
+max_delta = 3
+lr = 3e-4
+max_steps = 50_000
+eval_every = 500
+log_every = 50
+save_every = 5000
+checkpoint_dir = "checkpoints/jacobian"
+
+[system]
+device = "cuda:1"
+compile = true
+dtype = "bfloat16"
