@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import Config
+from .soft_md5 import SoftMD5, probs_to_soft_bits, bytes_to_bits
 
 
 def mask_message(
@@ -117,5 +118,95 @@ def sample(
         logits = model(x, hash_bytes, t)
         final = logits.argmax(dim=-1)
         x[is_masked] = final[is_masked]
+
+    return x
+
+
+def sample_guided(
+    model,
+    hash_bytes: torch.Tensor,
+    cfg: Config,
+    guidance_scale: float = 1.0,
+    steps: int | None = None,
+) -> torch.Tensor:
+    """Iterative unmasking with classifier guidance from differentiable MD5.
+
+    At each step:
+    1. Model predicts byte logits (diffusion prior)
+    2. Convert to soft bits, forward through differentiable MD5
+    3. Compute gradient of hash match loss w.r.t. logits
+    4. Nudge logits toward better hash match
+
+    Guidance is annealed: strong at high noise (early steps), zero at low noise
+    (late steps), since the approximate gradient is most useful for coarse
+    structure and the diffusion prior handles fine details.
+
+    Args:
+        model: the denoiser
+        hash_bytes: (B, 16) target hashes
+        cfg: config
+        guidance_scale: strength of guidance (0 = pure diffusion)
+        steps: number of sampling steps
+    Returns:
+        (B, 64) sampled message bytes
+    """
+    steps = steps or cfg.sampling_steps
+    B = hash_bytes.shape[0]
+    device = hash_bytes.device
+    L = cfg.seq_len
+
+    soft_md5 = SoftMD5().to(device)
+    # Target hash as bits: (B, 128)
+    target_bits = bytes_to_bits(hash_bytes).to(device)
+
+    x = torch.full((B, L), cfg.mask_token, dtype=torch.long, device=device)
+    is_masked = torch.ones(B, L, dtype=torch.bool, device=device)
+
+    for step in range(steps):
+        t_val = 1.0 - step / steps
+        t = torch.full((B,), t_val, device=device)
+
+        # --- Guidance: compute gradient w.r.t. logits ---
+        # Anneal guidance: linear decay, strong early, zero at end
+        guidance_weight = guidance_scale * t_val
+
+        if guidance_weight > 0:
+            # Need gradients for this part
+            with torch.enable_grad():
+                logits = model(x, hash_bytes, t)
+                logits_for_grad = logits.detach().requires_grad_(True)
+                probs = logits_for_grad.softmax(dim=-1)
+                soft_bits = probs_to_soft_bits(probs)
+                soft_hash = soft_md5(soft_bits)
+                hash_loss = ((soft_hash - target_bits) ** 2).sum(dim=-1).mean()
+                hash_loss.backward()
+                grad = logits_for_grad.grad
+
+            # Guided logits: subtract gradient (gradient points toward increasing loss)
+            logits = logits - guidance_weight * grad
+        else:
+            with torch.no_grad():
+                logits = model(x, hash_bytes, t)
+
+        with torch.no_grad():
+            probs = logits.softmax(dim=-1)
+            candidates = torch.multinomial(probs.view(-1, 256), 1).view(B, L)
+            confidence = probs.max(dim=-1).values
+
+            n_to_unmask = max(1, int(L * (1.0 / steps)))
+            confidence[~is_masked] = -1.0
+
+            _, indices = confidence.topk(min(n_to_unmask, L), dim=-1)
+            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(indices)
+            x[batch_idx, indices] = candidates[batch_idx, indices]
+            is_masked[batch_idx, indices] = False
+
+    # Fill remaining
+    if is_masked.any():
+        with torch.no_grad():
+            t = torch.zeros(B, device=device)
+            logits = model(x, hash_bytes, t)
+            final = logits.argmax(dim=-1)
+            x[is_masked] = final[is_masked]
 
     return x
