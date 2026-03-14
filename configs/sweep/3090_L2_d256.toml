@@ -1,0 +1,12 @@
+# 2 layers — sweet spot hypothesis
+[model]
+d_model = 256
+n_heads = 4
+n_layers = 2
+
+[training]
+batch_size = 2048
+lr = 1e-3
+
+[system]
+dtype = "bfloat16"

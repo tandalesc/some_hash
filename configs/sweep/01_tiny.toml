@@ -1,0 +1,10 @@
+# 1 layer, d=128 — minimum viable model
+# Can attention alone (no depth) learn MD5 structure?
+[model]
+d_model = 128
+n_heads = 4
+n_layers = 1
+
+[training]
+batch_size = 256
+lr = 3e-4

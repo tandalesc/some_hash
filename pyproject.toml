@@ -1,0 +1,18 @@
+[project]
+name = "some-hash"
+version = "0.1.0"
+description = "MD5 Preimage Generation via Conditional Discrete Diffusion"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["wandb"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

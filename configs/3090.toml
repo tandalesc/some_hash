@@ -1,0 +1,31 @@
+# RTX 3090 (24GB VRAM)
+# Start shallow — MD5 inversion via iterative diffusion may not need depth,
+# since each sampling step only makes incremental corrections.
+# The diffusion loop (64 steps) provides "virtual depth" at inference time.
+
+[model]
+d_model = 256
+n_heads = 4
+n_layers = 2
+dropout = 0.0
+
+[training]
+batch_size = 2048
+lr = 1e-3
+weight_decay = 0.01
+warmup_steps = 500
+max_steps = 50_000
+eval_every = 500
+log_every = 50
+save_every = 5000
+checkpoint_dir = "checkpoints/3090"
+
+[diffusion]
+sampling_steps = 64
+
+[system]
+device = "cuda:1"
+compile = true
+compile_mode = "reduce-overhead"
+dtype = "bfloat16"
+seed = 42

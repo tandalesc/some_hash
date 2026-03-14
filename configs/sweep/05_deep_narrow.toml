@@ -1,0 +1,9 @@
+# 6 layers, d=128 — tests if depth matters more than width
+[model]
+d_model = 128
+n_heads = 4
+n_layers = 6
+
+[training]
+batch_size = 256
+lr = 3e-4

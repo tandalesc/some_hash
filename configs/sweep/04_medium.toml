@@ -1,0 +1,9 @@
+# 4 layers, d=192 — middle ground
+[model]
+d_model = 192
+n_heads = 4
+n_layers = 4
+
+[training]
+batch_size = 256
+lr = 3e-4

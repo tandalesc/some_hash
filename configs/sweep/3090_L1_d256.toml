@@ -1,0 +1,12 @@
+# 1 layer — can a single attention pass + diffusion loop be enough?
+[model]
+d_model = 256
+n_heads = 4
+n_layers = 1
+
+[training]
+batch_size = 2048
+lr = 1e-3
+
+[system]
+dtype = "bfloat16"

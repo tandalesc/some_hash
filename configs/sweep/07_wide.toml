@@ -1,0 +1,11 @@
+# 2 layers, d=512 — extreme width, minimal depth
+# If MD5 inversion is mostly about per-step local correction,
+# wide+shallow might win on efficiency
+[model]
+d_model = 512
+n_heads = 8
+n_layers = 2
+
+[training]
+batch_size = 256
+lr = 1e-4

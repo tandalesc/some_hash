@@ -1,0 +1,27 @@
+# Apple Silicon Mac — MPS backend, no compile
+
+[model]
+d_model = 256
+n_heads = 4
+n_layers = 6
+dropout = 0.0
+
+[training]
+batch_size = 256
+lr = 3e-4
+weight_decay = 0.01
+warmup_steps = 1000
+max_steps = 100_000
+eval_every = 1000
+log_every = 100
+save_every = 10_000
+checkpoint_dir = "checkpoints/mac"
+
+[diffusion]
+sampling_steps = 64
+
+[system]
+device = "mps"
+compile = false
+dtype = "float32"
+seed = 42
