@@ -86,15 +86,19 @@ def run_validation(model, cfg, device, device_type, amp_dtype, use_amp, num_batc
         predicted_change = J_pred * deltas.float().unsqueeze(-1)
         actual_change = hash_changes.float()
 
-        cos_sim = F.cosine_similarity(
-            predicted_change.reshape(-1, 16),
-            actual_change.reshape(-1, 16),
-            dim=-1,
-        )
-
-        total_cos += cos_sim.sum().item()
-        total_positive += (cos_sim > 0).sum().item()
-        total_count += cos_sim.numel()
+        pred_flat = predicted_change.reshape(-1, 16)
+        actual_flat = actual_change.reshape(-1, 16)
+        # Only measure cosine on perturbations that actually changed the hash
+        nonzero_mask = actual_flat.abs().sum(dim=-1) > 0
+        if nonzero_mask.any():
+            cos_sim = F.cosine_similarity(
+                pred_flat[nonzero_mask],
+                actual_flat[nonzero_mask],
+                dim=-1,
+            )
+            total_cos += cos_sim.sum().item()
+            total_positive += (cos_sim > 0).sum().item()
+            total_count += cos_sim.numel()
 
     mean_cos = total_cos / total_count
     pct_positive = total_positive / total_count * 100.0
@@ -215,13 +219,19 @@ def train(cfg: JacobianConfig):
             actual_change = hash_changes.float()
 
             if cfg.loss_fn == "cosine":
-                # Negative cosine similarity (maximize alignment, not magnitude)
-                cos = F.cosine_similarity(
-                    predicted_change.reshape(-1, 16),
-                    actual_change.reshape(-1, 16),
-                    dim=-1,
-                )
-                loss = 1.0 - cos.mean()
+                pred_flat = predicted_change.reshape(-1, 16)
+                actual_flat = actual_change.reshape(-1, 16)
+                # Filter out zero-change perturbations (no signal)
+                nonzero_mask = actual_flat.abs().sum(dim=-1) > 0
+                if nonzero_mask.any():
+                    cos = F.cosine_similarity(
+                        pred_flat[nonzero_mask],
+                        actual_flat[nonzero_mask],
+                        dim=-1,
+                    )
+                    loss = 1.0 - cos.mean()
+                else:
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
             else:
                 loss = F.mse_loss(predicted_change, actual_change)
 
