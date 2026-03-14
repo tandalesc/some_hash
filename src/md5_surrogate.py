@@ -23,10 +23,14 @@ class BitRoundLayer(nn.Module):
 
     Input: 128 state bits + 32 message word bits + 2 round info = 162
     Output: 128 state bits
+
+    Uses a residual connection since MD5 rounds are structurally
+    state += f(state, msg, K), so the network only needs to learn the delta.
     """
 
-    def __init__(self, d_hidden: int = 512):
+    def __init__(self, d_hidden: int = 512, residual: bool = True):
         super().__init__()
+        self.residual = residual
         self.net = nn.Sequential(
             nn.Linear(162, d_hidden),
             nn.GELU(),
@@ -46,7 +50,10 @@ class BitRoundLayer(nn.Module):
             (B, 128) float — predicted next state bits
         """
         x = torch.cat([state, msg_word, round_info], dim=-1)
-        return self.net(x)
+        out = self.net(x)
+        if self.residual:
+            out = out + state
+        return out
 
 
 class ByteRoundLayer(nn.Module):
@@ -54,10 +61,14 @@ class ByteRoundLayer(nn.Module):
 
     Input: 16 state bytes + 4 message word bytes + 2 round info = 22
     Output: 16 state bytes
+
+    Uses a residual connection since MD5 rounds are structurally
+    state += f(state, msg, K), so the network only needs to learn the delta.
     """
 
-    def __init__(self, d_hidden: int = 256):
+    def __init__(self, d_hidden: int = 256, residual: bool = True):
         super().__init__()
+        self.residual = residual
         self.net = nn.Sequential(
             nn.Linear(22, d_hidden),
             nn.GELU(),
@@ -69,7 +80,10 @@ class ByteRoundLayer(nn.Module):
     def forward(self, state: torch.Tensor, msg_word: torch.Tensor,
                 round_info: torch.Tensor) -> torch.Tensor:
         x = torch.cat([state, msg_word, round_info], dim=-1)
-        return self.net(x)
+        out = self.net(x)
+        if self.residual:
+            out = out + state
+        return out
 
 
 # Alias for backward compat
