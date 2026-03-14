@@ -142,10 +142,16 @@ class MD5Surrogate(nn.Module):
         """
         B = message.shape[0]
         if self.bit_level:
-            # Convert each byte to 8 bits, group into 32-bit words
-            # message: (B, 64) bytes → (B, 64, 8) bits → (B, 512) → (B, 16, 32)
-            msg_bytes_int = (message * 255.0).round().long()
-            bits = _bytes_to_bits_flat(msg_bytes_int)  # (B, 512)
+            # Differentiable byte→bit decomposition: keeps gradients flowing.
+            # For each byte value v in [0,1] (=real_byte/255), extract 8 bits.
+            # bit_k ≈ floor((v * 255) / 2^k) % 2, approximated smoothly.
+            byte_vals = message * 255.0  # (B, 64) in [0, 255]
+            shifts = torch.arange(8, device=message.device, dtype=message.dtype)
+            # (B, 64, 1) / (1, 1, 8) → (B, 64, 8)
+            bits = torch.fmod(torch.floor(byte_vals.unsqueeze(-1) / (2.0 ** shifts)), 2.0)
+            # STE: forward is hard bits, backward passes through the continuous path
+            soft = torch.fmod(byte_vals.unsqueeze(-1) / (2.0 ** shifts), 2.0)
+            bits = bits.detach() + soft - soft.detach()
             return bits.reshape(B, 16, 32)
         else:
             return message.reshape(B, 16, 4)
