@@ -24,36 +24,39 @@ class BitRoundLayer(nn.Module):
     Input: 128 state bits + 32 message word bits + 2 round info = 162
     Output: 128 state bits
 
-    Uses a residual connection since MD5 rounds are structurally
-    state += f(state, msg, K), so the network only needs to learn the delta.
+    Permutation-aware: hardcodes the MD5 word rotation (a,b,c,d)→(d,new_b,b,c)
+    and only learns the 32-bit nonlinear update for word b.
     """
 
-    def __init__(self, d_hidden: int = 512, residual: bool = True):
+    def __init__(self, d_hidden: int = 512):
         super().__init__()
-        self.residual = residual
+        # Only predict 32 new bits (word b), rest is permutation
         self.net = nn.Sequential(
             nn.Linear(162, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
-            nn.Linear(d_hidden, 128),
+            nn.Linear(d_hidden, 32),
         )
 
     def forward(self, state: torch.Tensor, msg_word: torch.Tensor,
                 round_info: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            state: (B, 128) float — 4 words as 128 bits
+            state: (B, 128) float — bits [a:0-31, b:32-63, c:64-95, d:96-127]
             msg_word: (B, 32) float — 1 word as 32 bits
             round_info: (B, 2) float — [round_index/64, shift/25]
         Returns:
             (B, 128) float — predicted next state bits
         """
         x = torch.cat([state, msg_word, round_info], dim=-1)
-        out = self.net(x)
-        if self.residual:
-            out = out + state
-        return out
+        new_b = self.net(x)  # (B, 32) — the only learned output
+
+        # MD5 permutation: (a,b,c,d) → (d, new_b, b, c)
+        old_b = state[:, 32:64]
+        old_c = state[:, 64:96]
+        old_d = state[:, 96:128]
+        return torch.cat([old_d, new_b, old_b, old_c], dim=-1)
 
 
 class ByteRoundLayer(nn.Module):
@@ -62,28 +65,35 @@ class ByteRoundLayer(nn.Module):
     Input: 16 state bytes + 4 message word bytes + 2 round info = 22
     Output: 16 state bytes
 
-    Uses a residual connection since MD5 rounds are structurally
-    state += f(state, msg, K), so the network only needs to learn the delta.
+    Permutation-aware: hardcodes the MD5 word rotation (a,b,c,d)→(d,new_b,b,c)
+    and only learns the 4-byte nonlinear update for word b.
     """
 
-    def __init__(self, d_hidden: int = 256, residual: bool = True):
+    def __init__(self, d_hidden: int = 256):
         super().__init__()
-        self.residual = residual
+        # Only predict 4 new bytes (word b), rest is permutation
         self.net = nn.Sequential(
             nn.Linear(22, d_hidden),
             nn.GELU(),
             nn.Linear(d_hidden, d_hidden),
             nn.GELU(),
-            nn.Linear(d_hidden, 16),
+            nn.Linear(d_hidden, 4),
         )
 
     def forward(self, state: torch.Tensor, msg_word: torch.Tensor,
                 round_info: torch.Tensor) -> torch.Tensor:
+        """
+        State layout: bytes [a:0-3, b:4-7, c:8-11, d:12-15]
+        MD5 round: (a,b,c,d) → (d, new_b, b, c)
+        """
         x = torch.cat([state, msg_word, round_info], dim=-1)
-        out = self.net(x)
-        if self.residual:
-            out = out + state
-        return out
+        new_b = self.net(x)  # (B, 4) — the only learned output
+
+        # MD5 permutation: (a,b,c,d) → (d, new_b, b, c)
+        old_b = state[:, 4:8]
+        old_c = state[:, 8:12]
+        old_d = state[:, 12:16]
+        return torch.cat([old_d, new_b, old_b, old_c], dim=-1)
 
 
 # Alias for backward compat
